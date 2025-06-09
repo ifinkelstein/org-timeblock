@@ -4,7 +4,7 @@
 
 ;; Author: Ilya Chernyshov <ichernyshovvv@gmail.com>
 ;; Version: 0.2
-;; Package-Requires: ((emacs "28.1") (compat "29.1.4.1") (org "9.0") (svg "1.1"))
+;; Package-Requires: ((emacs "30.1")  (org "9.0") (svg "1.1"))
 ;; Keywords: org, calendar, timeblocking, agenda
 ;; URL: https://github.com/ichernyshovvv/org-timeblock
 
@@ -36,8 +36,6 @@
 (require 'org)
 (require 'svg)
 (require 'seq)
-(require 'compat)
-(require 'compat-macs)
 
 ;;;; Faces
 
@@ -361,15 +359,9 @@ are tagged with a tag in car."
 
 ;;;; Functions
 
-(compat-version "29.1")
-
-(compat-defun org-fold-show-context (&optional key)
-  "Make sure point and context are visible."
-  (org-show-context key))
-
 (defun org-timeblock-show-context ()
   "Make sure point and context are visible."
-  (compat-call org-fold-show-context 'agenda))
+  (org-fold-show-context 'agenda))
 
 (defsubst org-timeblock-format-time (format-string time)
   "Use FORMAT-STRING to format the time value TIME."
