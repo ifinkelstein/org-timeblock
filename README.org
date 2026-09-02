@@ -156,14 +156,39 @@ Almost all commands with the same bindings are available in
 
 ~M-x customize-group org-timeblock~ to see available customizable variables.
 
+** Rendering performance
+:PROPERTIES:
+:CUSTOM_ID: rendering-performance
+:END:
+
+The timeblock view is an SVG scene, but it is displayed as a stack of
+horizontal strip images rather than one window-sized image.  Emacs caches
+images by their SVG source, so when you select or mark a block only the few
+strips it overlaps are re-rasterized; the rest are cache hits.  On a
+1260x1230 view this takes navigation from ~110 ms per keystroke down to a
+few milliseconds.
+
+- ~org-timeblock-strip-height~ (default 48 px).  Nominal height of a strip.
+  Smaller strips mean less work per selection change but more image objects.
+- ~org-timeblock-prewarm-selection~ (default ~t~).  After each redraw, while
+  Emacs is idle, pre-rasterize the strips each block would produce when
+  selected, so the first visit to a block is also a cache hit.  Costs one
+  cached bitmap per touched strip per block; set to ~nil~ to disable.
+
+Strip images are created with ~:scale 1~ so that ~image-scaling-factor~ does
+not stretch the scene beyond the window (this also keeps mouse clicks aligned
+with blocks).
+
 * TODOs
 :PROPERTIES:
 :CUSTOM_ID: todos
 :END:
-- [ ] Implement caching mechanism for SVG data
+- [X] Implement caching mechanism for SVG data (strip rendering + image cache
+  pre-warming, see [[#rendering-performance][Rendering performance]])
 - [ ] Improve timeblocks layout algorithm
-- [ ] Split each column into a separate SVG image to improve the speed of
-  ~*org-timeblock*~ buffer redisplay
+- [X] Split the view into separate SVG images to improve the speed of
+  ~*org-timeblock*~ buffer redisplay (done per horizontal strip rather than
+  per column, so it also helps single-day views)
 - [ ] Create timeblock.el library that could be used for iCalendar and other
   time data
 
@@ -198,3 +223,17 @@ First tagged release.
   the first one
 - Added custom variable org-timeblock-files
 - Other minor bug fixes and improvements 8)
+** Unreleased
+- Rendering: the view is displayed as a stack of strip images; selecting or
+  marking a block re-rasterizes only the strips it overlaps (~110 ms -> a few
+  ms per navigation keystroke on a full-window view)
+- Rendering: selection states are pre-rasterized on idle after each redraw
+  (~org-timeblock-prewarm-selection~)
+- Fix: images are no longer stretched by ~image-scaling-factor~, so the view
+  fits the window and mouse clicks map to the right block
+- Fix: ~org-timeblock-forward-column~ / ~backward-column~ no longer redisplay
+  twice
+- Fix: ~org-timeblock-data~ is reset on every redraw instead of growing
+  without bound
+- ~org-timeblock-update-cache~ visits each agenda file once per redraw
+- Removed the compat dependency

@@ -229,6 +229,28 @@ Otherwise, it may be set to a list of filenames."
   :group 'org-timeblock
   :type 'boolean)
 
+(defcustom org-timeblock-strip-height 48
+  "Nominal height in pixels of one rendered strip of the timeblock view.
+
+The SVG scene is displayed as a stack of horizontal strip images
+instead of one big image.  When a block is selected or marked,
+only the strips it overlaps are re-rasterized, so smaller strips
+make navigation cheaper at the cost of more image objects."
+  :group 'org-timeblock
+  :type 'integer)
+
+(defcustom org-timeblock-prewarm-selection t
+  "Whether to pre-rasterize selection states of blocks while Emacs is idle.
+
+After each redraw, the strips that every block would produce when
+selected are rendered in the background and left in the image
+cache, so selecting a block with the navigation commands is a
+cache hit instead of a fresh rasterization.  Memory cost: one
+cached bitmap per strip a block overlaps, per block, until the
+image cache evicts them (see `image-cache-eviction-delay')."
+  :group 'org-timeblock
+  :type 'boolean)
+
 (defcustom org-timeblock-tag-colors
   nil
   "Faces for specific tags.
@@ -262,6 +284,21 @@ are tagged with a tag in car."
 (defvar org-timeblock-svg nil)
 (defvar org-timeblock-svg-width 0)
 (defvar org-timeblock-svg-height 0)
+
+(defvar org-timeblock--strips nil
+  "Vector of (START . END) pixel ranges of rendered strips.  END is exclusive.")
+(defvar org-timeblock--strip-markers nil
+  "Vector of markers, one per strip, pointing at the image character.")
+(defvar org-timeblock--strip-strings nil
+  "Vector of the last printed SVG data string per strip.")
+(defvar org-timeblock--strip-children nil
+  "Vector of the scene child nodes overlapping each strip.
+Computed once per redraw; node positions do not change between
+redraws, only their attributes do.")
+(defvar org-timeblock--prewarm-timer nil
+  "Idle timer driving `org-timeblock--prewarm-step', or nil.")
+(defvar org-timeblock--prewarm-queue nil
+  "Block rect nodes whose selected state is still to be pre-rasterized.")
 
 (defvar org-timeblock-daterange nil
   "The date range that is used to get and display schedule data.")
@@ -613,11 +650,174 @@ DATE is decoded-time value."
        (and (org-timeblock-date< start-ts date)
 	    (org-timeblock-date<= date end-ts))))))
 
+;;;; Strip rendering
+
+(defsubst org-timeblock--attr-number (node attr)
+  "Return numeric value of ATTR in NODE, or nil.
+Attribute values may be stored as numbers or as strings."
+  (let ((v (dom-attr node attr)))
+    (cond ((numberp v) v)
+	  ((stringp v) (string-to-number v)))))
+
+(defun org-timeblock--node-y-range (node)
+  "Return a conservative (YMIN . YMAX) pixel range covered by NODE."
+  (let ((fh (default-font-height)))
+    (pcase (dom-tag node)
+      ('rect
+       (let ((y (or (org-timeblock--attr-number node 'y) 0)))
+	 (cons y (+ y (or (org-timeblock--attr-number node 'height) 0)))))
+      ('line
+       (let ((y1 (or (org-timeblock--attr-number node 'y1) 0))
+	     (y2 (or (org-timeblock--attr-number node 'y2) 0)))
+	 (cons (1- (min y1 y2)) (1+ (max y1 y2)))))
+      ('text
+       (let ((y (or (org-timeblock--attr-number node 'y) 0)))
+	 (cons (- y fh) (+ y fh))))
+      (_ (cons 0 org-timeblock-svg-height)))))
+
+(defun org-timeblock--strip-children (start end)
+  "Return the child nodes of `org-timeblock-svg' overlapping [START;END)."
+  (seq-filter
+   (lambda (node)
+     (or (stringp node)
+	 (let ((range (org-timeblock--node-y-range node)))
+	   (and (< (car range) end) (> (cdr range) start)))))
+   (dom-children org-timeblock-svg)))
+
+(defun org-timeblock--strip-svg (start end children)
+  "Return SVG data string for the part of the scene in [START;END).
+CHILDREN are the scene nodes overlapping that range, as returned by
+`org-timeblock--strip-children'.  The SVG shares them with the scene DOM."
+  (with-temp-buffer
+    (svg-print
+     (apply #'dom-node 'svg
+	    `((width . ,org-timeblock-svg-width)
+	      (height . ,(- end start))
+	      (viewBox . ,(format "0 %d %d %d"
+				  start org-timeblock-svg-width (- end start)))
+	      (version . "1.1")
+	      (xmlns . "http://www.w3.org/2000/svg"))
+	    children))
+    (buffer-string)))
+
+(defsubst org-timeblock--strip-string (i)
+  "Return the current SVG data string of strip number I."
+  (let ((range (aref org-timeblock--strips i)))
+    (org-timeblock--strip-svg (car range) (cdr range)
+			      (aref org-timeblock--strip-children i))))
+
+(defun org-timeblock--strip-bounds ()
+  "Return a vector of (START . END) strip ranges tiling the scene height."
+  (let* ((h org-timeblock-svg-height)
+	 (n (max 1 (ceiling h (max 1 org-timeblock-strip-height))))
+	 (bounds (make-vector n nil)))
+    (dotimes (i n)
+      (aset bounds i (cons (/ (* i h) n) (/ (* (1+ i) h) n))))
+    bounds))
+
+(defsubst org-timeblock--strip-image (str)
+  "Return an image spec for strip data STR.
+The scene is laid out in window pixels, so `image-scaling-factor'
+must not be applied; otherwise the image overflows the window and
+block coordinates no longer match the mouse position."
+  (create-image str 'svg t :scale 1))
+
+(defun org-timeblock--insert-strips ()
+  "Insert `org-timeblock-svg' at point as a stack of strip images."
+  (setq-local line-spacing nil)
+  (setq org-timeblock--strips (org-timeblock--strip-bounds))
+  (let ((n (length org-timeblock--strips)))
+    (setq org-timeblock--strip-markers (make-vector n nil)
+	  org-timeblock--strip-strings (make-vector n nil)
+	  org-timeblock--strip-children (make-vector n nil))
+    (dotimes (i n)
+      (let ((range (aref org-timeblock--strips i)))
+	(aset org-timeblock--strip-children i
+	      (org-timeblock--strip-children (car range) (cdr range))))
+      (let ((str (org-timeblock--strip-string i)))
+	(unless (= i 0) (insert "\n"))
+	(aset org-timeblock--strip-markers i (point-marker))
+	(aset org-timeblock--strip-strings i str)
+	(insert-image (org-timeblock--strip-image str) " "))))
+  (org-timeblock--prewarm-start))
+
+(defun org-timeblock--update-strips ()
+  "Re-render only those strips whose SVG content changed."
+  (when (and org-timeblock--strips
+	     (> (length org-timeblock--strips) 0)
+	     (buffer-live-p (get-buffer org-timeblock-buffer)))
+    (with-current-buffer org-timeblock-buffer
+      (let ((inhibit-read-only t))
+	(dotimes (i (length org-timeblock--strips))
+	  (let ((str (org-timeblock--strip-string i))
+		(marker (aref org-timeblock--strip-markers i)))
+	    (unless (equal str (aref org-timeblock--strip-strings i))
+	      (aset org-timeblock--strip-strings i str)
+	      (when (and marker (< marker (point-max)))
+		(put-text-property marker (1+ marker)
+				   'display (org-timeblock--strip-image str))))))))))
+
+(defun org-timeblock--prewarm-cancel ()
+  "Stop pending selection pre-rasterization and clear its queue."
+  (when org-timeblock--prewarm-timer
+    (cancel-timer org-timeblock--prewarm-timer)
+    (setq org-timeblock--prewarm-timer nil))
+  (setq org-timeblock--prewarm-queue nil))
+
+(defun org-timeblock--prewarm-start ()
+  "Queue every block rect of `org-timeblock-svg' for pre-rasterization."
+  (org-timeblock--prewarm-cancel)
+  (when org-timeblock-prewarm-selection
+    (setq org-timeblock--prewarm-queue
+	  (seq-filter (lambda (node) (dom-attr node 'order))
+		      (dom-by-tag org-timeblock-svg 'rect)))
+    (when org-timeblock--prewarm-queue
+      (setq org-timeblock--prewarm-timer
+	    (run-with-idle-timer 0.5 nil #'org-timeblock--prewarm-step)))))
+
+(defun org-timeblock--prewarm-step ()
+  "Pre-rasterize the selected state of one queued block.
+Simulate the DOM mutation done by `org-timeblock-forward-block',
+force the affected strip images into the image cache, then revert.
+Reschedule itself while the queue is non-empty.  Return non-nil
+when work remains."
+  (setq org-timeblock--prewarm-timer nil)
+  (when (and org-timeblock--prewarm-queue
+	     org-timeblock--strips
+	     (> (length org-timeblock--strips) 0)
+	     (buffer-live-p (get-buffer org-timeblock-buffer)))
+    (let ((node (pop org-timeblock--prewarm-queue)))
+      (unless (or (dom-attr node 'select) (dom-attr node 'mark))
+	(let ((fill (dom-attr node 'fill))
+	      (range (org-timeblock--node-y-range node)))
+	  (unwind-protect
+	      (progn
+		(dom-set-attribute node 'orig-fill fill)
+		(dom-set-attribute
+		 node 'fill (face-attribute 'org-timeblock-select :background))
+		(dom-set-attribute node 'select t)
+		(dotimes (i (length org-timeblock--strips))
+		  (let ((strip (aref org-timeblock--strips i)))
+		    (when (and (< (car range) (cdr strip))
+			       (> (cdr range) (car strip)))
+		      (let ((str (org-timeblock--strip-string i)))
+			(unless (equal str (aref org-timeblock--strip-strings i))
+			  (image-size (org-timeblock--strip-image str) t)))))))
+	    (dom-set-attribute node 'fill fill)
+	    (dom-remove-attribute node 'select)))))
+    (when org-timeblock--prewarm-queue
+      (setq org-timeblock--prewarm-timer
+	    (run-with-idle-timer
+	     (time-add (or (current-idle-time) 0) 0.05)
+	     nil #'org-timeblock--prewarm-step))
+      t)))
+
 (defun org-timeblock-redraw-timeblocks ()
   "Redraw *org-timeblock* buffer."
   (with-current-buffer (get-buffer-create org-timeblock-buffer)
     (let ((inhibit-read-only t))
       (erase-buffer)
+      (setq org-timeblock-data nil)
       (if-let ((entries (org-timeblock-get-entries
 			 (car org-timeblock-daterange)
 			 (cdr org-timeblock-daterange)
@@ -885,10 +1085,19 @@ DATE is decoded-time value."
 					       (/ block-height (default-font-height)))))
 					 (if (= 0 lines-count) 1 lines-count)))
 				    `(,title))))
-			(let ((time-string
-			       (get-text-property 0 'time-string entry))
-			      (face (org-timeblock-get-colors
-				     (get-text-property 0 'tags entry))))
+			(let* ((time-string
+				(get-text-property 0 'time-string entry))
+			       (face (org-timeblock-get-colors
+				      (get-text-property 0 'tags entry)))
+			       (fill
+				(or
+				 (and
+				  (eq 'deadline (org-timeblock-get-ts-type entry))
+				  "#5b0103")
+				 (and face (face-attribute face :background nil 'default))
+				 (face-attribute
+				  (org-timeblock-get-saved-random-face title)
+				  :background nil 'default))))
 			  (when (< (/ block-width (default-font-width))
 				   (length time-string))
 			    (setq time-string nil))
@@ -923,15 +1132,11 @@ DATE is decoded-time value."
 			       2 1)
 			   :opacity "0.7"
 			   :order (cl-incf order)
-			   :fill
-			   (or
-			    (and
-			     (eq 'deadline (org-timeblock-get-ts-type entry))
-			     "#5b0103")
-			    (and face (face-attribute face :background nil 'default))
-			    (face-attribute
-			     (org-timeblock-get-saved-random-face title)
-			     :background nil 'default))
+			   :fill fill
+			   ;; Present from the start so that selecting a block
+			   ;; does not change the attribute set of the printed
+			   ;; SVG, keeping image-cache keys stable.
+			   :orig-fill fill
 			   ;; Same timestamp can be displayed in multiple
 			   ;; columns, so _column-number postfix is used to tell
 			   ;; that blocks apart
@@ -983,19 +1188,21 @@ DATE is decoded-time value."
 			    :fill (face-attribute 'default :foreground)
 			    :font-size
 			    (aref (font-info (face-font 'default)) 2)))))
-	    (svg-insert-image org-timeblock-svg))
+	    (org-timeblock--insert-strips))
 	(let* ((window (get-buffer-window org-timeblock-buffer))
 	       (window-height (window-body-height window t))
 	       (window-width (window-body-width window t))
 	       (message "No data."))
-	  (setq org-timeblock-svg (svg-create window-width window-height))
+	  (setq org-timeblock-svg-width window-width
+		org-timeblock-svg-height window-height
+		org-timeblock-svg (svg-create window-width window-height))
 	  (svg-text
 	   org-timeblock-svg message
 	   :y (/ window-height 2)
 	   :x (- (/ window-width 2)
 		 (/ (* (default-font-width) (length message)) 2))
 	   :fill (face-attribute 'default :foreground))
-	  (svg-insert-image org-timeblock-svg)))
+	  (org-timeblock--insert-strips)))
       (setq org-timeblock-mark-count 0)
       (org-timeblock-redisplay))))
 
@@ -1033,7 +1240,7 @@ DATE is decoded-time value."
 		     (and (= org-timeblock-column (1+ iter))
 			  'org-timeblock-select))))
 		result))))
-    (svg-possibly-update-image org-timeblock-svg)))
+    (org-timeblock--update-strips)))
 
 (defun org-timeblock-show-timeblocks ()
   "Switch to *org-timeblock* buffer in another window."
@@ -1048,6 +1255,7 @@ DATE is decoded-time value."
 (defun org-timeblock-quit ()
   "Exit `org-timeblock-list-mode'."
   (interactive)
+  (org-timeblock--prewarm-cancel)
   (quit-window t))
 
 (defun org-timeblock--schedule-time (&optional marker)
@@ -1312,23 +1520,22 @@ without time."
 (defun org-timeblock-update-cache ()
   "Update org-timeblock-cache.
 Return nil if buffers are up-to-date."
+  ;; This code is partially borrowed from `org-ql--select-cached'
+  ;; function which is part of org-ql project written by Adam Porter
   (when-let
       ((buffers-to-update
-	(mapcar
-	 #'find-file-noselect
-	 ;; This code is partially borrowed from `org-ql--select-cached'
-	 ;; function which is part of org-ql project written by Adam Porter
-	 (seq-filter
-	  (lambda (file)
-	    (let* ((buffer (find-file-noselect file))
+	(let (stale)
+	  (dolist (file (org-timeblock-files))
+	    (let* ((buffer (or (find-buffer-visiting file)
+			       (find-file-noselect file)))
 		   (modified-tick
 		    (alist-get file org-timeblock-buffers nil nil #'equal))
 		   (new-modified-tick (buffer-chars-modified-tick buffer)))
-	      (and (not (eq new-modified-tick modified-tick))
-		   (setf
-		    (alist-get file org-timeblock-buffers nil nil #'equal)
-		    new-modified-tick))))
-	  (org-timeblock-files)))))
+	      (unless (eq new-modified-tick modified-tick)
+		(setf (alist-get file org-timeblock-buffers nil nil #'equal)
+		      new-modified-tick)
+		(push buffer stale))))
+	  (nreverse stale))))
     (setq org-timeblock-cache
 	  (sort
 	   (apply
@@ -2055,8 +2262,8 @@ Otherwise, return nil."
   (if (= org-timeblock-column org-timeblock-span)
       (setq org-timeblock-column 1)
     (cl-incf org-timeblock-column))
-  (org-timeblock-forward-block)
-  (org-timeblock-redisplay))
+  (unless (org-timeblock-forward-block)
+    (org-timeblock-redisplay)))
 
 (defun org-timeblock-backward-column ()
   "Select the next column in *org-timeblock* buffer."
@@ -2064,8 +2271,8 @@ Otherwise, return nil."
   (if (= org-timeblock-column 1)
       (setq org-timeblock-column org-timeblock-span)
     (cl-decf org-timeblock-column))
-  (org-timeblock-forward-block)
-  (org-timeblock-redisplay))
+  (unless (org-timeblock-forward-block)
+    (org-timeblock-redisplay)))
 
 (defun org-timeblock-show-olp-maybe (marker)
   "Show outline path in echo area for the selected item.
@@ -2344,8 +2551,6 @@ SVG image (.svg), PDF (.pdf) is produced."
   (org-timeblock-unselect-block)
   (let ((file (expand-file-name file))
 	(svg (copy-sequence org-timeblock-svg)))
-    ;; delete marker to not trigger `svg-possibly-update-image'
-    (dom-remove-attribute svg :image)
     (with-temp-buffer
       (let* ((dates (org-timeblock-get-dates
 		     (car org-timeblock-daterange)
