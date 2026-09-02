@@ -233,6 +233,8 @@ First tagged release.
   fits the window and mouse clicks map to the right block
 - Fix: ~org-timeblock-forward-column~ / ~backward-column~ no longer redisplay
   twice
+- Fix: the image keymap attached by ~insert-image~ no longer shadows mode
+  bindings such as ~i~ (clock in) in the timeblock buffer
 - Fix: ~org-timeblock-data~ is reset on every redraw instead of growing
   without bound
 - ~org-timeblock-update-cache~ visits each agenda file once per redraw

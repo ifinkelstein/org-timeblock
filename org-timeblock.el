@@ -738,7 +738,11 @@ block coordinates no longer match the mouse position."
 	(unless (= i 0) (insert "\n"))
 	(aset org-timeblock--strip-markers i (point-marker))
 	(aset org-timeblock--strip-strings i str)
-	(insert-image (org-timeblock--strip-image str) " "))))
+	(let ((start (point)))
+	  (insert-image (org-timeblock--strip-image str) " ")
+	  ;; `insert-image' attaches `image-map', whose "i" prefix would
+	  ;; shadow `org-timeblock-clock-in' and other mode bindings.
+	  (remove-text-properties start (point) '(keymap nil))))))
   (org-timeblock--prewarm-start))
 
 (defun org-timeblock--update-strips ()
